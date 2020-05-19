@@ -1,0 +1,166 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+At the beginning of the analysis, we want to dig into the user characteristics and product characteristics to extract insights about their effects of impacting the click probability. For the binary classification, we'd like to utilize logistic regression and probit regression.
+```{r}
+email = read.csv("emaildata.csv")
+# delete first column
+email <- email[,3:9]
+
+# transform clicked as factor
+# email$hour <- as.factor(email$hour)
+email$clicked <- as.factor(email$clicked)
+str(email)
+```
+
+From the logistic regression, we can summarize some interesting findings.
+* the summary shows that short email is better than long email, increasing the log odds ratio of being clicked by 0.279. 
+* The large coefficient is the email version and it shows that personalized email type is way more better than genetic email type (increasing the log odd ratio of being clicked by). 
+* In term of hour, the coefficient of hour is significantly positive and it means that the latter the email sent to the customer in a day, the larger probability it would be clicked. 
+* Regarding to weekday, taking Friday as a benchmark, we can other weekdays all perform better than Friday. Within the weekday, although sending emails on Saturday and Sunday is better than on Friday, sending emails on Tuesday, Wednesday and Thursday is the best choice.
+* As EDA has mentioned before, there are 4 countries(US, UK, FR and ES). Taking ES(Spain) as the benchmark, customers in US(United States) and UK(United Kingdom) are most likely to click the email. The country effect is same for US and UK. Although, the cofficient of FR(France) is negative but it isn't significance. Customers in FR and ES have no difference in clicking the email.
+* Having Last purchase is also important and plays a positive role. The more purhcases the customer makes before, the more likely the customer will click the email.
+
+We also post the regression result using the probit link function. There isn't any difference between sign and significance except for the value of coefficients. 
+```{r}
+# run logistic model
+email.logit <- glm(clicked ~ email_text+email_version+hour+weekday+user_country+user_past_purchases,
+                   data=email, family = binomial(link="logit"))
+summary(email.logit)
+
+# run the probit model
+email.probit <- glm(clicked ~ email_text+email_version+hour+weekday+user_country+user_past_purchases,
+                   data=email, family = binomial(link="probit"))
+summary(email.probit)
+```
+
+
+Using `hour` feature as a continuous variable from 1 to 24 doesn't make sense so we bin the hour into morning, afternoon and evening and rerun the logistic and probit models using new hour_binned feature.
+
+From the new result, we can see that the probability of being clicked doesn't increase monotonically with hour. Using the afternoon as the benchmark, sending emails in the morning is better than in the afternoon while sending emails in the afternoon is worse than in the afternoon. 
+```{r}
+#Bin the variables according to the rules described above
+email$hour_binned = ifelse(email$hour>=6 & email$hour<14, "morning", 
+                           ifelse (email$hour>= 14 & email$hour<22, "afternoon",
+                                   "night"
+                                   )
+                          )
+email$hour_binned= as.factor(email$hour_binned)
+
+# run logistic model
+email.logit <- glm(clicked ~ email_text+email_version+hour_binned+weekday+user_country+user_past_purchases,
+                   data=email, family = binomial(link="logit"))
+summary(email.logit)
+
+# run the probit model
+email.probit <- glm(clicked ~ email_text+email_version+hour_binned+weekday+user_country+user_past_purchases,
+                   data=email, family = binomial(link="probit"))
+summary(email.probit)
+```
+
+# Personalization
+
+## Run the basic model
+Using simple logistic regression and probit regression above helped us extract insights and understand how each variable impact the output. For instance, we found out that personalized as well as short emails are better, we should send emails on weekdays, etc. However, the fact that on an average short emails are better, doesn’t imply that short emails are better for every user we have. 
+
+Next, firstly, we'd like to appraoch the personalization problem. The goal of personalization is to take insights one step further and find the best email characteristics for each user. So a given user will receive a long email, another one a short one, one will receive it in the night, and one in the morning, etc.
+
+In this problem, we'd like to use Random Forest which is a strong classification algorithm to deal with binary classification problem. There's another point to make before we build the model. As EDA graph shows before, user past purchases has a long-tail distribution and we also bin the past purchases like hour to make Random Forest more efficient and easier to run.
+
+```{r}
+library(randomForest)
+set.seed(4321)
+email$purchase_binned =  ifelse(email$user_past_purchases==0, "None",
+                              ifelse(email$user_past_purchases<4, "Low",
+                                     ifelse(email$user_past_purchases<8, "Medium",
+                                            "High"  
+                                            )
+                                     )
+                              )
+#Make it as factor so RF is happy
+email$purchase_binned = as.factor(email$purchase_binned)
+
+#just reorder the dataset so the label is at the end and we remove the continuous variables
+email=email[,c(5,9,1,2,4,8,7)] 
+
+# prepare training and test set
+train_indeces <- sample(nrow(data), size = nrow(data)*0.66)
+train <- data[train_indeces,]
+test <-  data[-train_indeces,]
+
+#build the model. We choose a RF, but this personalization approach works with all kinds of models
+rf_model = randomForest(x=train[, -ncol(train)], y=train$clicked, 
+                        xtest = test[, -ncol(test)], ytest=test$clicked,
+                        classwt=c(2, 1), ntree=50, keep.forest=TRUE)
+
+#let's check the model output
+rf_model
+```
+OOB and test error are very similar, so we are confident we are not overfitting. And overall the model is working pretty well. We only had 2% of clicks, but despite that the model is not predicting all events as class 0, we actually manage to correctly predict ~1/3 of clicks (changing weights helped). And class 0 error didn’t go up that much either.
+
+
+## Predict click-through-rate for each segment
+The second step is to create a new dataset with all unique combinations of our variables. We will then feed this dataset into the model and, for each unique combination, we will get a prediction. The model prediction represents click-rate and, therefore, this step is meant to estimate probability of clicking for each unique combination of country, # of purchases, email text, weekday, etc.
+
+```{r}
+#remove the label, we don't need it here
+email_unique = email[, -ncol(email)] 
+
+#create all unique combinations of our features
+email_unique = email_unique[!duplicated(email_unique),]
+
+#feed this into our model and get a prediction for each row
+prediction = predict(rf_model, email_unique, type="prob")[,2]
+
+#Finally, we add these predictions to the dataset
+email_unique$prediction = prediction
+print(email_unique[1:10,])
+
+```
+
+So, looking at the table output, if we send a short email, generic, in the morning, on Thursday, to US customers with few purchases, our model predicts no clicks. And so on for each row. For each unique segment, we have got the probability of clicking.
+
+
+## Identify the best email characteristics for each user
+The third step is to identify the variables that can be personalized. This typically means separating user characteristics from product characteristics, and focus on the second ones. After all, you can choose when to send the email or its message, but you can’t realistically move a customer from Spain to UK.
+
+Then, we group by unique combinations of user characteristics and find the product characteristics with the highest probability of clicking. So, for instance, one group will be US customers with 0 purchases (these are user characteristics). And then we will look for the combination of all the other variables that maximize probability of clicking. And that’s it. That combination will tell us how our product should be for those users and we will send emails accordingly. The more variables you have about your users, the more granular will be the groups and, therefore, the more specific will be the personalization.
+
+```{r}
+require(dplyr)
+
+best_segment = email_unique %>% 
+               group_by(user_country, purchase_binned) %>% 
+               arrange(desc(prediction)) %>% 
+               filter(row_number()==1)
+print(best_segment)
+```
+
+So now we have a model that returns the best email strategy for each user and that’s how we should be sending email to maximize overall click-through-rate. Btw note how even the best email strategy has super low model predictions for users with no purchases, regardless of the country. Once again, you won’t win those people just by tweaking the email.
+
+```{r}
+#Firstly let's get count by group. We need this for the weighted average at the end
+count_segment = data %>% group_by(user_country, purchase_binned) %>% summarize(weight = n()/nrow(data))
+
+#Merge it, so in our final dataset we also have count
+best_segment = merge(best_segment, count_segment)
+
+#Now let's add class1 and class 0 errors to the dataset. We will take it from the test error confusion matrix
+#We define positive predictive value (ppv) as the proportion of times the model is right when it predicts 1, this is also called precision 
+ppv = rf_model$confusion[2,2]/sum(rf_model$confusion[,2])
+
+#We also need false omission rate (FOR). Indeed, those are actual clicks (the model is mistakenly predicting non-click, but it is actually a click)
+forate = rf_model$confusion[2,1]/sum(rf_model$confusion[,1])
+
+#Adjusted predicted click-rate for each segment
+best_segment$adjusted_prediction = best_segment$prediction * ppv + (1-best_segment$prediction) * forate
+
+#Finally, let's multiply this by the weight of each segment in the dataset and compare it
+data.frame( predicted_click_rate = sum(best_segment$adjusted_prediction*best_segment$weight),
+                  old_click_rate = mean(as.numeric(as.character(data$clicked)))
+                )
+
+```
+
